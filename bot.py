@@ -72,8 +72,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Получаем ник поддержки из базы
     try:
-        support_result = supabase.table("settings").select("value").eq("key", "telegram_support").single().execute()
-        support_username = support_result.data.get("value", "@support") if support_result.data else "@support"
+        support_result = supabase.table("settings").select("value").eq("key", "telegram_support").execute()
+        support_username = support_result.data[0].get("value", "@support") if support_result.data else "@support"
     except:
         support_username = "@support"
     
@@ -341,11 +341,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        support_result = supabase.table("settings").select("value").eq("key", "telegram_support").single().execute()
-        support = support_result.data.get("value", "@support") if support_result.data else "@support"
+        support_result = supabase.table("settings").select("value").eq("key", "telegram_support").execute()
+        support = support_result.data[0].get("value", "@support") if support_result.data else "@support"
         
-        payment_result = supabase.table("payment_details").select("*").eq("is_active", True).limit(1).single().execute()
-        payment = payment_result.data
+        payment_result = supabase.table("payment_details").select("*").eq("is_active", True).limit(1).execute()
+        payment = payment_result.data[0] if payment_result.data else None
     except:
         support = "@support"
         payment = None
