@@ -532,7 +532,12 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск бота"""
+    # Создаем приложение с JobQueue
     app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Проверяем что JobQueue доступен
+    if app.job_queue is None:
+        print("⚠️ JobQueue недоступен, уведомления будут отключены")
     
     # ConversationHandler для добавления товара
     product_conv = ConversationHandler(
@@ -545,8 +550,7 @@ def main():
             PRODUCT_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_get_weight)],
             PRODUCT_IMAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_get_image)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
     
     # ConversationHandler для админ поддержки
@@ -555,8 +559,7 @@ def main():
         states={
             ADMIN_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_support)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
     
     # ConversationHandler для админ реквизитов
@@ -567,8 +570,7 @@ def main():
             ADMIN_CARD_HOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_card_holder)],
             ADMIN_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_bank)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
     
     # Регистрация handlers
@@ -581,8 +583,12 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm_"))
     app.add_handler(CallbackQueryHandler(worker_callback))
     
-    # Проверка уведомлений каждые 10 сек
-    app.job_queue.run_repeating(check_notifications, interval=10, first=5)
+    # Проверка уведомлений каждые 10 сек (только если JobQueue доступен)
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(check_notifications, interval=10, first=5)
+        print("✅ JobQueue настроен для уведомлений")
+    else:
+        print("⚠️ JobQueue недоступен - уведомления отключены")
     
     print("Бот запущен...")
     app.run_polling()
