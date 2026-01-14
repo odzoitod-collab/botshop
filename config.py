@@ -5,7 +5,7 @@ class Config:
     """Конфигурация для Telegram бота BlackLeaf Shop"""
     
     # Токен бота (получить у @BotFather)
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8333018588:AAHKuqcxw7qYLO_Y2Lzl-3LbjQpAdu3taeo")
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "7489614359:AAElCcpsC3_6YFAuYxKsblHcA3kjx01mHVc")
     
     # URL веб-приложения
     WEB_APP_URL: str = os.getenv("WEB_APP_URL", "https://shop-green-kappa.vercel.app/")
