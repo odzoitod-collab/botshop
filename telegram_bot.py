@@ -1,0 +1,703 @@
+import logging
+import sys
+import asyncio
+import html
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, ReplyKeyboardRemove
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, ContextTypes
+)
+from supabase import create_client, Client
+from config import Config
+
+# ============================================
+# НАСТРОЙКИ
+# ============================================
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+try:
+    supabase: Client = create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY)
+except Exception as e:
+    logger.critical(f"FATAL: Ошибка Supabase: {e}")
+    sys.exit(1)
+
+# Состояния для создания товара
+(CREATE_NAME, CREATE_CATEGORY, CREATE_STRAIN, CREATE_THC, CREATE_CBD,
+ CREATE_WEIGHT, CREATE_PRICE, CREATE_DESCRIPTION, CREATE_EFFECTS, CREATE_IMAGES) = range(10)
+
+
+# ============================================
+# КЭШИРОВАНИЕ
+# ============================================
+
+class Cache:
+    def __init__(self):
+        self._data = {}
+        self._expiry = {}
+
+    def get(self, key: str) -> Optional[Any]:
+        if key in self._data:
+            if datetime.now() < self._expiry[key]:
+                return self._data[key]
+            del self._data[key]
+        return None
+
+    def set(self, key: str, value: Any, ttl_seconds: int = 300):
+        self._data[key] = value
+        self._expiry[key] = datetime.now() + timedelta(seconds=ttl_seconds)
+
+    def clear(self, prefix: str = None):
+        if prefix:
+            keys = [k for k in self._data if k.startswith(prefix)]
+            for k in keys: del self._data[k]
+        else:
+            self._data.clear()
+
+db_cache = Cache()
+
+# ============================================
+# БАЗА ДАННЫХ
+# ============================================
+
+class DB:
+    @staticmethod
+    async def _run(func):
+        return await asyncio.to_thread(func)
+
+    @staticmethod
+    async def get_worker(user) -> dict:
+        cache_key = f"worker_{user.id}"
+        cached = db_cache.get(cache_key)
+        if cached: return cached
+
+        def query():
+            res = supabase.table('workers').select('*').eq('telegram_id', user.id).execute()
+            if res.data:
+                try:
+                    supabase.table('workers').update({
+                        'username': user.username,
+                        'first_name': user.first_name,
+                        'last_activity': datetime.now().isoformat()
+                    }).eq('telegram_id', user.id).execute()
+                except: pass
+                return res.data[0]
+            
+            try:
+                new_w = supabase.table('workers').insert({
+                    'telegram_id': user.id,
+                    'username': user.username,
+                    'first_name': user.first_name
+                }).execute()
+                return new_w.data[0] if new_w.data else None
+            except: return None
+
+        worker = await DB._run(query)
+        if worker: db_cache.set(cache_key, worker, ttl_seconds=120)
+        return worker
+
+    @staticmethod
+    async def register_referral(user, referral_code: str) -> Optional[int]:
+        def query():
+            try:
+                referrer = supabase.table('workers').select('id, telegram_id').eq('referral_code', referral_code).execute()
+                if not referrer.data: return None
+                
+                worker_data = referrer.data[0]
+                existing = supabase.table('worker_clients').select('id').eq('telegram_id', user.id).execute()
+                if existing.data: return None
+                
+                supabase.table('worker_clients').insert({
+                    'worker_id': worker_data['id'],
+                    'telegram_id': user.id,
+                    'username': user.username,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name
+                }).execute()
+                
+                return worker_data['telegram_id']
+            except Exception as e:
+                logger.error(f"Ref error: {e}")
+                return None
+        
+        referrer_tg_id = await DB._run(query)
+        if referrer_tg_id:
+             db_cache.clear(f"stats_{referrer_tg_id}")
+        return referrer_tg_id
+
+    @staticmethod
+    async def get_worker_stats(worker_id: int) -> dict:
+        cache_key = f"stats_id_{worker_id}"
+        cached = db_cache.get(cache_key)
+        if cached: return cached
+
+        def query():
+            c = supabase.table('worker_clients').select('id', count='exact').eq('worker_id', worker_id).execute()
+            m = supabase.table('products').select('id', count='exact').eq('worker_id', worker_id).eq('is_active', True).execute()
+            return {'clients': c.count, 'products': m.count}
+        
+        stats = await DB._run(query)
+        db_cache.set(cache_key, stats, ttl_seconds=60)
+        return stats
+
+    @staticmethod
+    async def get_worker_clients_list(worker_id: int, limit=20):
+        def query():
+            return supabase.table('worker_clients')\
+                .select('first_name, username, created_at')\
+                .eq('worker_id', worker_id)\
+                .order('created_at', desc=True)\
+                .limit(limit)\
+                .execute().data
+        return await DB._run(query)
+
+    @staticmethod
+    async def get_products_short(worker_id: int):
+        def query():
+            return supabase.table('products').select('id, name, category, price').eq('worker_id', worker_id).eq('is_active', True).execute().data
+        return await DB._run(query)
+
+    @staticmethod
+    async def create_product(worker_id: int, data: dict):
+        def query():
+            product = {
+                'worker_id': worker_id,
+                'name': data['name'],
+                'category': data['category'],
+                'strain': data.get('strain') if data.get('strain') != 'Нет' else None,
+                'thc': data.get('thc'),
+                'cbd': data.get('cbd'),
+                'weight': data.get('weight', 1),
+                'price': data['price'],
+                'description': data.get('description', ''),
+                'effects': data.get('effects', []),
+                'images': data.get('images', []),
+                'is_verified': True,
+                'is_active': True,
+                'in_stock': True
+            }
+            return supabase.table('products').insert(product).execute().data[0]
+        return await DB._run(query)
+    
+    @staticmethod
+    async def delete_product(product_id: int):
+        def query():
+            return supabase.table('products').update({'is_active': False}).eq('id', product_id).execute()
+        return await DB._run(query)
+
+
+# ============================================
+# ОСНОВНЫЕ КОМАНДЫ
+# ============================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    
+    if context.args:
+        ref_code = context.args[0]
+        referrer_id = await DB.register_referral(user, ref_code)
+        
+        if referrer_id:
+            try:
+                safe_name = html.escape(user.first_name)
+                username_text = f"(@{user.username})" if user.username else ""
+                msg = (
+                    f"🔔 <b>Новый клиент!</b>\n\n"
+                    f"👤 Клиент: <b>{safe_name}</b> {username_text}\n"
+                    f"📅 Дата: {datetime.now().strftime('%d.%m %H:%M')}"
+                )
+                await context.bot.send_message(chat_id=referrer_id, text=msg, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление: {e}")
+
+    safe_user_name = html.escape(user.first_name)
+    
+    text = (
+        f"🌿 <b>Привет, {safe_user_name}!</b>\n\n"
+        "Добро пожаловать в <b>BlackLeaf Shop</b>.\n"
+        "Премиальный магазин легализованных растительных продуктов.\n\n"
+        "👇 <b>Нажми кнопку, чтобы открыть каталог:</b>"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🛒 Открыть магазин", web_app=WebAppInfo(url=Config.WEB_APP_URL))]]
+    
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+    
+    async def remove_keyboard():
+        try:
+            msg = await context.bot.send_message(update.effective_chat.id, "⠀", reply_markup=ReplyKeyboardRemove())
+            await msg.delete()
+        except: pass
+    asyncio.create_task(remove_keyboard())
+
+async def worker_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    worker = await DB.get_worker(user)
+    
+    if not worker:
+        await update.message.reply_text("❌ Ошибка профиля")
+        return
+
+    stats = await DB.get_worker_stats(worker['id'])
+    ref_link = f"https://t.me/{(await context.bot.get_me()).username}?start={worker['referral_code']}"
+    
+    text = (
+        f"🏪 <b>Панель управления BlackLeaf</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"🆔 ID: <code>{worker['telegram_id']}</code>\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"├ 👥 Клиентов: <b>{stats['clients']}</b>\n"
+        f"└ 📦 Товаров: <b>{stats['products']}</b>\n\n"
+        f"🔗 <b>Реферальная ссылка:</b>\n"
+        f"<code>{ref_link}</code>"
+    )
+    
+    kb = [
+        [InlineKeyboardButton("👥 Мои клиенты", callback_data="worker_clients")],
+        [InlineKeyboardButton("📦 Мои товары", callback_data="worker_products")],
+        [InlineKeyboardButton("➕ Добавить товар", callback_data="create_product")]
+    ]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+# ============================================
+# ОБРАБОТЧИКИ МЕНЮ
+# ============================================
+
+async def worker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user = update.effective_user
+    worker = await DB.get_worker(user)
+    if not worker: return
+
+    if data == "worker_menu":
+        stats = await DB.get_worker_stats(worker['id'])
+        ref_link = f"https://t.me/{(await context.bot.get_me()).username}?start={worker['referral_code']}"
+        text = (
+            f"🏪 <b>Панель управления BlackLeaf</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"📊 Клиентов: <b>{stats['clients']}</b> | Товаров: <b>{stats['products']}</b>\n"
+            f"🔗 Ссылка: <code>{ref_link}</code>"
+        )
+        kb = [
+            [InlineKeyboardButton("👥 Мои клиенты", callback_data="worker_clients")],
+            [InlineKeyboardButton("📦 Мои товары", callback_data="worker_products")],
+            [InlineKeyboardButton("➕ Добавить товар", callback_data="create_product")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    elif data == "worker_clients":
+        clients = await DB.get_worker_clients_list(worker['id'])
+        
+        if not clients:
+            text = "👥 <b>Мои клиенты</b>\n\n😔 У вас пока нет клиентов.\nРаспространяйте свою ссылку!"
+        else:
+            text = f"👥 <b>Последние клиенты ({len(clients)}):</b>\n\n"
+            for c in clients:
+                try:
+                    date_obj = datetime.fromisoformat(c['created_at'].replace('Z', ''))
+                    date_str = date_obj.strftime('%d.%m')
+                except: date_str = "??"
+                
+                safe_name = html.escape(c['first_name'] or "Без имени")
+                link = f"@{c['username']}" if c['username'] else "Нет юзернейма"
+                text += f"👤 <b>{safe_name}</b> ({link}) — {date_str}\n"
+
+        kb = [[InlineKeyboardButton("◀️ Назад", callback_data="worker_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    elif data == "worker_products":
+        products = await DB.get_products_short(worker['id'])
+        if not products:
+            text = "📦 <b>Мои товары</b>\n\nСписок пуст."
+            kb = [[InlineKeyboardButton("➕ Добавить товар", callback_data="create_product")],
+                  [InlineKeyboardButton("◀️ Назад", callback_data="worker_menu")]]
+        else:
+            text = f"📦 <b>Мои товары ({len(products)}):</b>"
+            kb = []
+            for p in products:
+                kb.append([InlineKeyboardButton(f"{p['name']} ({p['category']}) — {p['price']}₽", callback_data=f"del_ask_{p['id']}")])
+            kb.append([InlineKeyboardButton("➕ Добавить новый", callback_data="create_product")])
+            kb.append([InlineKeyboardButton("◀️ В меню", callback_data="worker_menu")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    elif data.startswith("del_ask_"):
+        pid = data.split("_")[2]
+        text = "🗑 <b>Удалить этот товар?</b>\nВосстановить будет невозможно."
+        kb = [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"del_confirm_{pid}")],
+            [InlineKeyboardButton("❌ Нет, назад", callback_data="worker_products")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    elif data.startswith("del_confirm_"):
+        pid = int(data.split("_")[2])
+        await DB.delete_product(pid)
+        db_cache.clear(f"stats_id_{worker['id']}")
+        await query.answer("Товар удалён!", show_alert=True)
+        await worker_callback(update, context)
+
+
+# ============================================
+# СОЗДАНИЕ ТОВАРА (WIZARD)
+# ============================================
+
+async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new'] = {}
+    
+    text = "📦 <b>Создание товара (1/10)</b>\n\nВведите <b>название</b> товара:"
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return CREATE_NAME
+
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data['new']['name'] = html.escape(text)
+    
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]]
+    
+    await update.message.reply_text(
+        "📦 <b>Шаг 2/10</b>\nВведите <b>категорию</b> товара:",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_CATEGORY
+
+async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data['new']['category'] = html.escape(text)
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_strain")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    
+    await update.message.reply_text(
+        "📦 <b>Шаг 3/10</b>\nВведите <b>сорт/тип</b>:\n\n<i>Или пропустите, если не нужно.</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_STRAIN
+
+async def get_strain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data['new']['strain'] = html.escape(text) if text.lower() not in ["нет", "-", ""] else None
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_thc")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await update.message.reply_text(
+        "📦 <b>Шаг 4/10</b>\nВведите <b>THC %</b>:\n\n<i>Или пропустите, если не нужно.</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_THC
+
+async def skip_strain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new']['strain'] = None
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_thc")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await query.edit_message_text(
+        "📦 <b>Шаг 4/10</b>\nВведите <b>THC %</b>:\n\n<i>Или пропустите, если не нужно.</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_THC
+
+async def get_thc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    try:
+        thc = float(text.replace(',', '.'))
+        context.user_data['new']['thc'] = thc
+    except:
+        context.user_data['new']['thc'] = None
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_cbd")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await update.message.reply_text(
+        "📦 <b>Шаг 5/10</b>\nВведите <b>CBD %</b>:\n\n<i>Или пропустите, если не нужно.</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_CBD
+
+async def skip_thc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new']['thc'] = None
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_cbd")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await query.edit_message_text(
+        "📦 <b>Шаг 5/10</b>\nВведите <b>CBD %</b>:\n\n<i>Или пропустите, если не нужно.</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_CBD
+
+async def get_cbd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    try:
+        cbd = float(text.replace(',', '.'))
+        context.user_data['new']['cbd'] = cbd
+    except:
+        context.user_data['new']['cbd'] = None
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_weight")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await update.message.reply_text(
+        "📦 <b>Шаг 6/10</b>\nВведите <b>вес/объём</b>:\n\n<i>Например: 1г, 100мл, 1шт</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_WEIGHT
+
+async def skip_cbd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new']['cbd'] = None
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_weight")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await query.edit_message_text(
+        "📦 <b>Шаг 6/10</b>\nВведите <b>вес/объём</b>:\n\n<i>Например: 1г, 100мл, 1шт</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_WEIGHT
+
+async def get_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    try:
+        # Пробуем извлечь число
+        weight = float(''.join(c for c in text.replace(',', '.') if c.isdigit() or c == '.') or '1')
+        context.user_data['new']['weight'] = weight
+    except:
+        context.user_data['new']['weight'] = 1
+    
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]]
+    await update.message.reply_text(
+        "📦 <b>Шаг 7/10</b>\nВведите <b>цену</b> в рублях:",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_PRICE
+
+async def skip_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new']['weight'] = 1
+    
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]]
+    await query.edit_message_text(
+        "📦 <b>Шаг 7/10</b>\nВведите <b>цену</b> в рублях:",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_PRICE
+
+async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    try:
+        price = int(text.replace(' ', ''))
+        if price <= 0: raise ValueError()
+        context.user_data['new']['price'] = price
+    except:
+        await update.message.reply_text("❌ Введите корректную цену:", parse_mode=ParseMode.HTML)
+        return CREATE_PRICE
+    
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_description")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await update.message.reply_text(
+        "📦 <b>Шаг 8/10</b>\nВведите <b>описание</b> товара:\n\n<i>Опишите характеристики, вкус, эффекты.</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_DESCRIPTION
+
+async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data['new']['description'] = html.escape(text)
+    return await show_effects_selection(update, context)
+
+async def skip_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new']['description'] = ''
+    return await show_effects_selection_query(query, context)
+
+async def show_effects_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_effects")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await update.message.reply_text(
+        "📦 <b>Шаг 9/10</b>\nВведите <b>эффекты/характеристики</b> через запятую:\n\n<i>Например: Расслабление, Энергия, Креативность</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_EFFECTS
+
+async def show_effects_selection_query(query, context: ContextTypes.DEFAULT_TYPE) -> int:
+    kb = [
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_effects")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await query.edit_message_text(
+        "📦 <b>Шаг 9/10</b>\nВведите <b>эффекты/характеристики</b> через запятую:\n\n<i>Например: Расслабление, Энергия, Креативность</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_EFFECTS
+
+async def get_effects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    effects = [html.escape(e.strip()) for e in text.split(',') if e.strip()]
+    context.user_data['new']['effects'] = effects
+    
+    kb = [
+        [InlineKeyboardButton("✅ Готово", callback_data="done_images")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await update.message.reply_text(
+        "📸 <b>Шаг 10/10</b>\nОтправьте <b>фото</b> товара (можно несколько).\n\nКогда закончите — нажмите «✅ Готово»",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_IMAGES
+
+async def skip_effects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['new']['effects'] = []
+    
+    kb = [
+        [InlineKeyboardButton("✅ Готово", callback_data="done_images")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_create")]
+    ]
+    await query.edit_message_text(
+        "📸 <b>Шаг 10/10</b>\nОтправьте <b>фото</b> товара (можно несколько).\n\nКогда закончите — нажмите «✅ Готово»",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
+    return CREATE_IMAGES
+
+async def get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message.photo: 
+        await update.message.reply_text("❌ Это не фото.")
+        return CREATE_IMAGES
+    
+    if 'images' not in context.user_data['new']: 
+        context.user_data['new']['images'] = []
+    
+    file_id = update.message.photo[-1].file_id
+    file_path = (await context.bot.get_file(file_id)).file_path
+    context.user_data['new']['images'].append(file_path)
+    count = len(context.user_data['new']['images'])
+    
+    kb = [[InlineKeyboardButton("✅ Готово, создать", callback_data="done_images")]]
+    await update.message.reply_text(f"✅ Фото #{count} сохранено.\nЕще фото или Готово?", reply_markup=InlineKeyboardMarkup(kb))
+    return CREATE_IMAGES
+
+async def finish_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    data = context.user_data.get('new')
+    if not data or not data.get('images'):
+        data['images'] = ['https://via.placeholder.com/400']
+    
+    user = update.effective_user
+    worker = await DB.get_worker(user)
+    
+    await query.edit_message_text("⏳ <b>Сохраняем товар...</b>", parse_mode=ParseMode.HTML)
+    
+    await DB.create_product(worker['id'], data)
+    db_cache.clear(f"stats_id_{worker['id']}")
+    
+    await query.edit_message_text(
+        f"✅ <b>Товар «{data['name']}» успешно создан!</b>\nОн уже виден в каталоге.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ В меню", callback_data="worker_menu")]]),
+        parse_mode=ParseMode.HTML
+    )
+    context.user_data.pop('new', None)
+    return ConversationHandler.END
+
+async def cancel_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.edit_message_text("❌ Создание отменено.", 
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Меню", callback_data="worker_menu")]]))
+    return ConversationHandler.END
+
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+    app = Application.builder().token(Config.BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(create_start, pattern="^create_product$")],
+        states={
+            CREATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            CREATE_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_category)],
+            CREATE_STRAIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_strain),
+                CallbackQueryHandler(skip_strain, pattern="^skip_strain$")
+            ],
+            CREATE_THC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_thc),
+                CallbackQueryHandler(skip_thc, pattern="^skip_thc$")
+            ],
+            CREATE_CBD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_cbd),
+                CallbackQueryHandler(skip_cbd, pattern="^skip_cbd$")
+            ],
+            CREATE_WEIGHT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_weight),
+                CallbackQueryHandler(skip_weight, pattern="^skip_weight$")
+            ],
+            CREATE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_price)],
+            CREATE_DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_description),
+                CallbackQueryHandler(skip_description, pattern="^skip_description$")
+            ],
+            CREATE_EFFECTS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_effects),
+                CallbackQueryHandler(skip_effects, pattern="^skip_effects$")
+            ],
+            CREATE_IMAGES: [
+                MessageHandler(filters.PHOTO, get_photo),
+                CallbackQueryHandler(finish_create, pattern="^done_images$")
+            ]
+        },
+        fallbacks=[CallbackQueryHandler(cancel_create, pattern="^cancel_create$")]
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("worker", worker_panel))
+    app.add_handler(CommandHandler("admin", worker_panel))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(worker_callback))
+
+    print("🌿 BlackLeaf Bot started!")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
